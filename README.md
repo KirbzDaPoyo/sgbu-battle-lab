@@ -33,7 +33,7 @@ No packages are downloaded and no internet connection is required. The app also 
 - Striker / Hunter — single-target attacker
 - Sweeper / Blaster — lane-wide attacker
 - Amplifier / Supporter — offensive support
-- Suppressor / Inquisitor — debuff specialist
+- Suppressor / Hexer — debuff specialist
 - Defender / Protector — team shielder
 - Healer / Medic — restorative support
 

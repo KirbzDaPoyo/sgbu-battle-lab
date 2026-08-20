@@ -73,10 +73,10 @@
       ultimate: { name: "Synchronized Clock", description: "Grant every deployed ally ATK Up and advance them by 20%.", type: "teamAdvance", multiplier: 0.25 },
     },
     {
-      id: "inquisitor",
+      id: "hexer",
       name: "Null-05",
       className: "Suppressor",
-      subclass: "Inquisitor",
+      subclass: "Hexer",
       role: "Debuff specialist",
       color: "#6fc5cf",
       maxHp: 1280,
@@ -153,4 +153,3 @@
     enemies,
   };
 })();
-
