@@ -1,0 +1,12 @@
+{
+  "name": "sgbu-battle-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Offline-first debug battle simulator for SGBU combat mechanics.",
+  "scripts": {
+    "start": "node server.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/engine.test.mjs"
+  }
+}
