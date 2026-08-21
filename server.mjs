@@ -1,9 +1,10 @@
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { extname, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const port = Number(process.env.PORT || 4173);
-const root = new URL("./", import.meta.url).pathname;
+const root = resolve(fileURLToPath(new URL("./", import.meta.url)));
 const types = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -15,8 +16,8 @@ createServer(async (request, response) => {
   try {
     const pathname = decodeURIComponent(new URL(request.url, `http://${request.headers.host}`).pathname);
     const relative = pathname === "/" ? "index.html" : pathname.slice(1);
-    const file = normalize(join(root, relative));
-    if (!file.startsWith(root)) throw new Error("Invalid path");
+    const file = resolve(root, relative);
+    if (file !== root && !file.startsWith(root + sep)) throw new Error("Invalid path");
     const info = await stat(file);
     const resolved = info.isDirectory() ? join(file, "index.html") : file;
     const body = await readFile(resolved);

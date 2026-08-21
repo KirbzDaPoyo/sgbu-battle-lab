@@ -5,8 +5,11 @@
   const storageKey = "sgbu-battle-lab:data-v1";
 
   let runtimeData = loadRuntimeData();
-  let state = engine.makeInitialState(runtimeData);
+  let setup = makeSetupState(runtimeData);
+  let carriedResources = null;
+  let state = engine.makeInitialState(runtimeData, { autoStart: false, seed: setup.seed });
   let history = [];
+  let pendingAction = null;
   let selectedDebugId = state.players[0].instanceId;
   let editorOpen = false;
   let debugOpen = true;
@@ -17,7 +20,7 @@
   let defenseStartedAt = 0;
   let defenseProgress = 0;
   let timersPaused = false;
-  let battleSpeed = 1;
+
   let notice = "";
   let noticeTimer = null;
 
@@ -26,11 +29,54 @@
       const stored = localStorage.getItem(storageKey);
       if (!stored) return engine.clone(defaults);
       const parsed = JSON.parse(stored);
-      if (!Array.isArray(parsed.units) || !Array.isArray(parsed.enemies) || !parsed.config) throw new Error("Invalid data");
+      const errors = engine.validateData(parsed);
+      if (errors.length) throw new Error(errors[0]);
       return parsed;
     } catch {
       return engine.clone(defaults);
     }
+  }
+
+  function makeSetupState(source, previous = {}) {
+    const availableUnitIds = source.units.map((unit) => unit.id);
+    const retainedDeployed = (previous.deployedIds || []).filter((id) => availableUnitIds.includes(id)).slice(0, 4);
+    const deployedIds = [...retainedDeployed];
+    for (const id of availableUnitIds) {
+      if (deployedIds.length >= 4) break;
+      if (!deployedIds.includes(id)) deployedIds.push(id);
+    }
+    const availableEnemyIds = source.enemies.map((enemy) => enemy.id);
+    const enemyIds = previous.enemyIds
+      ? previous.enemyIds.filter((id) => availableEnemyIds.includes(id))
+      : [...availableEnemyIds];
+    return {
+      deployedIds,
+      enemyIds,
+      seed: Number.isFinite(previous.seed) ? previous.seed : 137,
+
+      rules: {
+        baseAp: previous.rules?.baseAp ?? source.config.baseAp,
+        initialSp: previous.rules?.initialSp ?? source.config.initialSp,
+        initialEnergyPercent: previous.rules?.initialEnergyPercent ?? source.config.initialEnergyPercent,
+        enemyDelayMs: previous.rules?.enemyDelayMs ?? source.config.enemyDelayMs,
+        defenseDurationMs: previous.rules?.defenseDurationMs ?? source.config.defenseDurationMs,
+        parryWindowScale: previous.rules?.parryWindowScale ?? source.config.parryWindowScale,
+      },
+    };
+  }
+
+  function buildEncounterData() {
+    const encounter = engine.clone(runtimeData);
+    const deployed = new Set(setup.deployedIds);
+    const unitsById = new Map(encounter.units.map((unit) => [unit.id, unit]));
+    encounter.units = [
+      ...setup.deployedIds.map((id) => unitsById.get(id)).filter(Boolean),
+      ...encounter.units.filter((unit) => !deployed.has(unit.id)),
+    ];
+    const enemies = new Set(setup.enemyIds);
+    encounter.enemies = encounter.enemies.filter((enemy) => enemies.has(enemy.id));
+    Object.assign(encounter.config, setup.rules);
+    return encounter;
   }
 
   function saveHistory() {
@@ -84,6 +130,45 @@
   function actionTargetFor(unit, action) {
     if (["buff", "heal"].includes(action.type)) return selectedAlly()?.instanceId;
     return selectedEnemy()?.instanceId;
+  }
+
+  function queueBasic(kind) {
+    const actor = currentActor();
+    const target = selectedEnemy();
+    const definitions = {
+      normal: { name: "Normal ATK", description: `Deal ${Math.round(state.config.normalBasicMultiplier * 100)}% ATK damage and gain ${state.config.normalSpGain} SP.`, cost: "1 AP" },
+      charged: { name: "Charged ATK", description: `Deal ${Math.round(state.config.chargedBasicMultiplier * 100)}% ATK damage and spend ${state.config.chargedSpCost} SP.`, cost: `1 AP · ${state.config.chargedSpCost} SP` },
+      plunge: { name: "Plunging ATK", description: `Deal ${Math.round(state.config.plungeBasicMultiplier * 100)}% ATK damage. Requires Above Ground and consumes that state.`, cost: "1 AP" },
+    };
+    if (!actor || !target || !definitions[kind]) return;
+    pendingAction = { type: "basic", kind, actorName: actor.name, targetId: target.instanceId, targetName: target.name, ...definitions[kind] };
+    render();
+  }
+
+  function queueSkill() {
+    const actor = currentActor();
+    if (!actor) return;
+    const targetId = actionTargetFor(actor, actor.skill);
+    const target = engine.findUnit(state, targetId);
+    if (!target) return;
+    pendingAction = {
+      type: "skill",
+      actorName: actor.name,
+      name: actor.skill.name,
+      description: actor.skill.description,
+      cost: `2 AP · ${actor.skill.spCost} SP`,
+      targetId,
+      targetName: target.name,
+    };
+    render();
+  }
+
+  function confirmPendingAction() {
+    const action = pendingAction;
+    if (!action) return;
+    pendingAction = null;
+    if (action.type === "basic") mutate(() => engine.useBasic(state, action.kind, action.targetId));
+    else mutate(() => engine.useSkill(state, action.targetId));
   }
 
   function statusBadges(unit) {
@@ -155,6 +240,15 @@
 
   function renderActions() {
     const actor = currentActor();
+    if (state.phase === "interrupt") {
+      const continuation = state.interrupt?.continuation;
+      const detail = continuation === "resumePlayer"
+        ? `${actor?.name || "The active unit"} has ${state.currentAp} AP remaining.`
+        : continuation === "finishTurn"
+          ? "The active turn will end when you continue."
+          : "The Action Value timeline will advance when you continue.";
+      return `<div class="waiting-state ultimate-window"><span class="interrupt-mark">U</span><div><strong>Ultimate window</strong><small>${detail} Use any ready Ultimate now, or continue without one.</small></div><button class="continue-button" data-continue-battle>Continue</button></div>`;
+    }
     const enabled = actor?.team === "player" && state.phase === "player";
     if (!enabled) {
       return `<div class="waiting-state"><span class="pulse-dot"></span><div><strong>${state.phase === "enemy" ? "Enemy action approaching" : state.phase === "defense" ? "Defense input required" : state.phase === "victory" ? "Simulation complete" : "Waiting for timeline"}</strong><small>${state.phase === "enemy" ? "The enemy is selecting its targets." : "Use the controls shown for the current phase."}</small></div></div>`;
@@ -166,9 +260,9 @@
         <div class="ap-pips" aria-label="${state.currentAp} AP remaining">${Array.from({ length: Math.max(2, state.currentAp) }, (_, index) => `<i class="${index < state.currentAp ? "filled" : ""}"></i>`).join("")}<b>${state.currentAp} AP</b></div>
       </div>
       <div class="action-grid">
-        <button class="action-button" data-basic="normal" ${state.currentAp < 1 ? "disabled" : ""}><span>1 AP</span><strong>Normal ATK</strong><small>100% ATK · +${state.config.normalSpGain} SP</small></button>
-        <button class="action-button" data-basic="charged" ${state.currentAp < 1 || actor.sp < state.config.chargedSpCost ? "disabled" : ""}><span>1 AP</span><strong>Charged ATK</strong><small>155% ATK · −${state.config.chargedSpCost} SP</small></button>
-        <button class="action-button" data-basic="plunge" ${state.currentAp < 1 || !actor.airborne ? "disabled" : ""}><span>1 AP</span><strong>Plunging ATK</strong><small>135% ATK · requires Above Ground</small></button>
+        <button class="action-button" data-basic="normal" ${state.currentAp < 1 ? "disabled" : ""}><span>1 AP</span><strong>Normal ATK</strong><small>${Math.round(state.config.normalBasicMultiplier * 100)}% ATK · +${state.config.normalSpGain} SP</small></button>
+        <button class="action-button" data-basic="charged" ${state.currentAp < 1 || actor.sp < state.config.chargedSpCost ? "disabled" : ""}><span>1 AP</span><strong>Charged ATK</strong><small>${Math.round(state.config.chargedBasicMultiplier * 100)}% ATK · −${state.config.chargedSpCost} SP</small></button>
+        <button class="action-button" data-basic="plunge" ${state.currentAp < 1 || !actor.airborne ? "disabled" : ""}><span>1 AP</span><strong>Plunging ATK</strong><small>${Math.round(state.config.plungeBasicMultiplier * 100)}% ATK · requires Above Ground</small></button>
         <button class="action-button skill-button" data-skill ${state.currentAp < 2 || actor.sp < skill.spCost ? "disabled" : ""}><span>2 AP · ${skill.spCost} SP</span><strong>${skill.name}</strong><small>${skill.description}</small></button>
       </div>
       <div class="action-footer"><span>Enemy target: <strong>${selectedEnemy()?.name || "None"}</strong></span><span>Ally target: <strong>${selectedAlly()?.name || "None"}</strong></span><button class="text-button" data-end-turn>End sequence</button></div>`;
@@ -176,11 +270,15 @@
 
   function renderUltimates() {
     return state.players.filter((unit) => unit.onField).sort((a, b) => a.slot - b.slot).map((unit) => {
-      const ready = unit.alive && unit.energy >= unit.maxEnergy && !["defense", "victory", "defeat"].includes(state.phase);
-      return `<button class="ultimate-button ${ready ? "ready" : ""}" data-ultimate="${unit.instanceId}" style="--unit:${unit.color}" ${ready ? "" : "disabled"}><span>${unit.name}</span><strong>${unit.ultimate.name}</strong><small>${Math.round(unit.energy)}/${unit.maxEnergy} Energy · 0 AP interrupt</small></button>`;
+      const ready = unit.alive && unit.energy >= unit.maxEnergy && !state.replacementIds.length && !["defense", "victory", "defeat"].includes(state.phase);
+      return `<button class="ultimate-button ${ready ? "ready" : ""}" data-ultimate="${unit.instanceId}" style="--unit:${unit.color}" ${ready ? "" : "disabled"}><span>${unit.name}</span><strong>${unit.ultimate.name}</strong><small class="ultimate-description">${unit.ultimate.description}</small><small class="ultimate-meta">${Math.round(unit.energy)}/${unit.maxEnergy} Energy · 0 AP interrupt</small></button>`;
     }).join("");
   }
 
+  function renderActionConfirmation() {
+    if (!pendingAction) return "";
+    return `<div class="modal-backdrop"><div class="modal action-confirmation" role="dialog" aria-modal="true" aria-labelledby="action-confirmation-title"><h2 id="action-confirmation-title">Confirm ${pendingAction.name}</h2><p>${pendingAction.description}</p><dl><div><dt>Actor</dt><dd>${pendingAction.actorName}</dd></div><div><dt>Target</dt><dd>${pendingAction.targetName}</dd></div><div><dt>Cost</dt><dd>${pendingAction.cost}</dd></div></dl><div class="confirmation-actions"><button type="button" data-cancel-action>Cancel</button><button type="button" class="confirm-action" data-confirm-action>Use ${pendingAction.name}</button></div></div></div>`;
+  }
   function renderLog() {
     return state.log.map((entry) => `<li class="log-${entry.type}"><span>T${entry.turn}</span><p>${entry.message}</p></li>`).join("");
   }
@@ -208,8 +306,8 @@
           <label class="check"><input data-force-crit type="checkbox" ${state.forceCrit ? "checked" : ""}><span>Force CRIT</span></label>
           <label class="check"><input data-pause-timers type="checkbox" ${timersPaused ? "checked" : ""}><span>Pause timing meter</span></label>
           <label class="field wide"><span>Defense outcome</span><select data-force-defense><option value="timed" ${state.forceDefense === "timed" ? "selected" : ""}>Use timing</option><option value="success" ${state.forceDefense === "success" ? "selected" : ""}>Force success</option><option value="fail" ${state.forceDefense === "fail" ? "selected" : ""}>Force failure</option></select></label>
-          <label class="field wide"><span>Battle speed</span><input data-speed type="range" min="0.5" max="2" step="0.25" value="${battleSpeed}"><output>${battleSpeed.toFixed(2)}×</output></label>
-          <div class="debug-buttons"><button data-ready-ults>Fill Ultimates</button><button data-bank-ap>Bank +1 AP</button><button data-undo ${history.length ? "" : "disabled"}>Undo</button><button data-reset>Reset battle</button></div>
+
+          <div class="debug-buttons"><button data-ready-ults>Fill Ultimates</button><button data-bank-ap>Bank +1 AP</button><button data-undo ${history.length ? "" : "disabled"}>Undo</button><button data-new-encounter>New encounter</button><button data-reset>Full reset</button></div>
           <div class="debug-buttons"><button data-export-log>Export log</button><button data-editor>Open data editor</button></div>
           <section class="inspector"><h3>Damage breakdown</h3>${renderBreakdown()}</section>
         </div>` : ""}
@@ -240,14 +338,92 @@
 
   function renderEditor() {
     if (!editorOpen) return "";
-    return `<div class="modal-backdrop"><div class="modal editor-modal"><div class="editor-heading"><div><span class="eyebrow">Runtime data</span><h2>Unit and rules editor</h2></div><button data-close-editor aria-label="Close editor">×</button></div><p>Edit the JSON, apply it, and the battle will reset. Changes are stored only in this browser.</p><textarea data-editor-json spellcheck="false">${escapeHtml(JSON.stringify(runtimeData, null, 2))}</textarea><div class="editor-actions"><button data-download-data>Download JSON</button><button data-restore-data>Restore defaults</button><button class="primary" data-apply-data>Apply and reset</button></div></div></div>`;
+    return `<div class="modal-backdrop"><div class="modal editor-modal"><div class="editor-heading"><div><span class="eyebrow">Runtime data</span><h2>Unit and rules editor</h2></div><button data-close-editor aria-label="Close editor">×</button></div><p>Edit the JSON and apply it to reopen encounter setup. Changes are stored only in this browser.</p><textarea data-editor-json spellcheck="false">${escapeHtml(JSON.stringify(runtimeData, null, 2))}</textarea><div class="editor-actions"><button data-download-data>Download JSON</button><button data-restore-data>Restore defaults</button><button class="primary" data-apply-data>Apply to setup</button></div></div></div>`;
   }
 
   function escapeHtml(value) {
     return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
 
+  function renderSetupUnit(unit) {
+    const fieldIndex = setup.deployedIds.indexOf(unit.id);
+    const selected = fieldIndex >= 0;
+    return `
+      <button type="button" class="setup-unit ${selected ? "selected" : ""}" data-setup-unit="${unit.id}" style="--unit:${unit.color}" aria-pressed="${selected}">
+        <span class="setup-unit-mark">${selected ? fieldIndex + 1 : "R"}</span>
+        <span class="setup-unit-copy"><strong>${unit.name}</strong><small>${unit.className} · ${unit.subclass}</small></span>
+        <span class="setup-unit-stats"><b>SPD ${unit.speed}</b><b>HP ${unit.maxHp}</b></span>
+        <span class="setup-unit-state">${selected ? "On field" : "Reserve"}</span>
+      </button>`;
+  }
+
+  function renderSetupEnemy(enemy) {
+    const selected = setup.enemyIds.includes(enemy.id);
+    return `
+      <button type="button" class="setup-enemy ${selected ? "selected" : ""}" data-setup-enemy="${enemy.id}" style="--unit:${enemy.color}" aria-pressed="${selected}">
+        <span class="setup-enemy-mark">${enemy.lane === "front" ? "F" : "R"}${enemy.column}</span>
+        <span><strong>${enemy.name}</strong><small>${enemy.lane} lane · column ${enemy.column}</small></span>
+        <b>${selected ? "Included" : "Excluded"}</b>
+      </button>`;
+  }
+
+  function renderSetup() {
+    const ready = setup.deployedIds.length === 4 && setup.enemyIds.length > 0;
+    const reserveCount = Math.max(0, runtimeData.units.length - setup.deployedIds.length);
+    return `
+      <header class="app-header"><div class="brand"><span class="brand-mark">S</span><div><strong>SGBU Battle Lab</strong><small>MECHANICS SIMULATOR · BUILD 0.1</small></div></div><div class="header-state"><span class="phase phase-setup">setup</span><span>Battle paused</span><span>Seed ${setup.seed}</span></div></header>
+      <main class="setup-shell">
+        <section class="setup-lead">
+          <div>
+            <h1>Configure the encounter</h1>
+            <p>Choose the active formation, opposition, and test conditions. The Action Value timeline begins only after you confirm this screen.</p>
+          </div>
+          <dl class="setup-summary">
+            <div><dt>On field</dt><dd>${setup.deployedIds.length}/4</dd></div>
+            <div><dt>Reserves</dt><dd>${reserveCount}</dd></div>
+            <div><dt>Enemies</dt><dd>${setup.enemyIds.length}</dd></div>
+          </dl>
+        </section>
+        <div class="setup-layout">
+          <section class="panel setup-section setup-roster">
+            <div class="setup-section-heading"><div><h2>Player formation</h2><p>Select exactly four units. Selection order determines field slots; everyone else begins in reserve.</p></div><span>${setup.deployedIds.length === 4 ? "Formation ready" : "Select " + (4 - setup.deployedIds.length) + " more"}</span></div>
+            <div class="setup-unit-grid">${runtimeData.units.map(renderSetupUnit).join("")}</div>
+          </section>
+          <aside class="setup-side">
+            <section class="panel setup-section">
+              <div class="setup-section-heading"><div><h2>Test conditions</h2><p>Common encounter controls. Every other value remains available in the JSON editor.</p></div></div>
+              <div class="setup-rule-grid">
+                <label><span>Seed</span><input data-setup-seed type="number" min="0" step="1" value="${setup.seed}"></label>
+
+                <label><span>Base AP</span><input data-setup-rule="baseAp" type="number" min="1" max="10" step="1" value="${setup.rules.baseAp}"></label>
+                <label><span>Initial SP</span><input data-setup-rule="initialSp" type="number" min="0" step="1" value="${setup.rules.initialSp}"></label>
+                <label><span>Initial Energy (%)</span><input data-setup-rule="initialEnergyPercent" type="number" min="0" max="100" step="1" value="${setup.rules.initialEnergyPercent}"><small>percent of each unit's maximum</small></label>
+                <label><span>Enemy delay</span><input data-setup-rule="enemyDelayMs" type="number" min="0" step="50" value="${setup.rules.enemyDelayMs}"><small>milliseconds</small></label>
+                <label><span>Defense meter</span><input data-setup-rule="defenseDurationMs" type="number" min="250" step="50" value="${setup.rules.defenseDurationMs}"><small>milliseconds</small></label>
+                <label><span>Parry scale</span><input data-setup-rule="parryWindowScale" type="number" min="0.1" max="1" step="0.01" value="${setup.rules.parryWindowScale}"></label>
+              </div>
+            </section>
+            <section class="panel setup-section setup-enemies">
+              <div class="setup-section-heading"><div><h2>Enemy formation</h2><p>Toggle combatants without changing their configured lane or column.</p></div><span>${setup.enemyIds.length} active</span></div>
+              <div class="setup-enemy-list">${runtimeData.enemies.map(renderSetupEnemy).join("")}</div>
+            </section>
+            <section class="setup-launch">
+              <div><strong>${ready ? "Encounter ready" : "Configuration incomplete"}</strong><small>${carriedResources ? "Personal SP and Energy will carry into this encounter." : "Units begin with the configured personal resources."}</small></div>
+              <div class="setup-launch-actions"><button type="button" data-setup-defaults>Reset setup</button><button type="button" data-editor>Advanced JSON</button><button type="button" class="setup-start" data-start-battle ${ready ? "" : "disabled"}>Start battle</button></div>
+            </section>
+          </aside>
+        </div>
+      </main>
+      ${notice ? `<div class="toast">${notice}</div>` : ""}
+      ${renderEditor()}`;
+  }
+
   function render() {
+    if (state.phase === "setup") {
+      root.innerHTML = renderSetup();
+      bindSetupEvents();
+      return;
+    }
     const deployed = state.players.filter((unit) => unit.onField).sort((a, b) => a.slot - b.slot);
     const reserves = state.players.filter((unit) => !unit.onField);
     root.innerHTML = `
@@ -262,10 +438,56 @@
         <aside class="side-column"><section class="timeline panel"><div class="panel-title"><span><b>TIMELINE</b> Live Action Value</span></div><div class="timeline-list">${renderTimeline()}</div></section>${renderDebugPanel()}<section class="combat-log panel ${logOpen ? "open" : ""}"><button class="panel-heading" data-toggle-log><span><b>LOG</b> Combat events</span><i>${logOpen ? "−" : "+"}</i></button>${logOpen ? `<ol>${renderLog()}</ol>` : ""}</section></aside>
       </main>
       ${notice ? `<div class="toast">${notice}</div>` : ""}
-      ${renderDefense()}${renderReplacement()}${renderEditor()}`;
+      ${renderDefense()}${renderReplacement()}${renderActionConfirmation()}${renderEditor()}`;
     bindEvents();
     if (!editorOpen && state.phase === "enemy") scheduleEnemyAttack();
     if (!editorOpen && state.phase === "defense") startDefenseMeter();
+  }
+
+  function bindSetupEvents() {
+    root.querySelectorAll("[data-setup-unit]").forEach((button) => button.addEventListener("click", () => {
+      const id = button.dataset.setupUnit;
+      if (setup.deployedIds.includes(id)) {
+        setup.deployedIds = setup.deployedIds.filter((unitId) => unitId !== id);
+      } else if (setup.deployedIds.length < 4) {
+        setup.deployedIds.push(id);
+      } else {
+        showNotice("Four field slots are already assigned. Remove one before adding another.");
+      }
+      render();
+    }));
+    root.querySelectorAll("[data-setup-enemy]").forEach((button) => button.addEventListener("click", () => {
+      const id = button.dataset.setupEnemy;
+      setup.enemyIds = setup.enemyIds.includes(id)
+        ? setup.enemyIds.filter((enemyId) => enemyId !== id)
+        : [...setup.enemyIds, id];
+      render();
+    }));
+    root.querySelectorAll("[data-setup-rule]").forEach((input) => input.addEventListener("change", () => {
+      setup.rules[input.dataset.setupRule] = Number(input.value);
+      render();
+    }));
+    root.querySelector("[data-setup-seed]")?.addEventListener("change", (event) => {
+      setup.seed = Math.max(0, Math.floor(Number(event.target.value) || 0));
+      render();
+    });
+
+    root.querySelector("[data-setup-defaults]")?.addEventListener("click", () => {
+      setup = makeSetupState(runtimeData);
+      render();
+    });
+    root.querySelector("[data-start-battle]")?.addEventListener("click", startConfiguredBattle);
+    root.querySelector("[data-editor]")?.addEventListener("click", () => {
+      editorOpen = true;
+      render();
+    });
+    root.querySelector("[data-close-editor]")?.addEventListener("click", () => {
+      editorOpen = false;
+      render();
+    });
+    root.querySelector("[data-apply-data]")?.addEventListener("click", applyEditorData);
+    root.querySelector("[data-restore-data]")?.addEventListener("click", restoreDefaults);
+    root.querySelector("[data-download-data]")?.addEventListener("click", () => download("sgbu-battle-data.json", JSON.stringify(runtimeData, null, 2), "application/json"));
   }
 
   function bindEvents() {
@@ -277,20 +499,21 @@
       state.selectedAllyId = button.dataset.ally;
       render();
     }));
-    root.querySelectorAll("[data-basic]").forEach((button) => button.addEventListener("click", () => mutate(() => engine.useBasic(state, button.dataset.basic, selectedEnemy()?.instanceId))));
-    root.querySelector("[data-skill]")?.addEventListener("click", () => {
-      const actor = currentActor();
-      mutate(() => engine.useSkill(state, actionTargetFor(actor, actor.skill)));
+    root.querySelectorAll("[data-basic]").forEach((button) => button.addEventListener("click", () => queueBasic(button.dataset.basic)));
+    root.querySelector("[data-skill]")?.addEventListener("click", queueSkill);
+    root.querySelector("[data-cancel-action]")?.addEventListener("click", () => {
+      pendingAction = null;
+      render();
     });
+    root.querySelector("[data-confirm-action]")?.addEventListener("click", confirmPendingAction);
+    root.querySelector("[data-continue-battle]")?.addEventListener("click", () => mutate(() => engine.continueBattle(state)));
     root.querySelectorAll("[data-ultimate]").forEach((button) => button.addEventListener("click", () => {
       const actor = engine.findUnit(state, button.dataset.ultimate);
       mutate(() => engine.useUltimate(state, actor.instanceId, actionTargetFor(actor, actor.ultimate)));
     }));
     root.querySelectorAll("[data-switch]").forEach((button) => button.addEventListener("click", () => mutate(() => engine.switchUnits(state, button.dataset.switch))));
-    root.querySelector("[data-end-turn]")?.addEventListener("click", () => mutate(() => {
-      engine.finishCurrentTurn(state);
-      return { ok: true };
-    }));
+    root.querySelector("[data-end-turn]")?.addEventListener("click", () => mutate(() => engine.endPlayerTurn(state)));
+
     root.querySelectorAll("[data-defense]").forEach((button) => button.addEventListener("click", () => submitDefense(button.dataset.defense)));
     root.querySelectorAll("[data-replace]").forEach((button) => button.addEventListener("click", () => mutate(() => engine.replaceDefeated(state, state.replacementIds[0], button.dataset.replace))));
     root.querySelector("[data-toggle-debug]")?.addEventListener("click", () => { debugOpen = !debugOpen; render(); });
@@ -301,9 +524,13 @@
       if (!unit) return;
       saveHistory();
       const key = input.dataset.stat;
-      const maximum = key === "hp" ? unit.maxHp : key === "sp" ? unit.maxSp : key === "energy" ? unit.maxEnergy : Number.POSITIVE_INFINITY;
-      unit[key] = Math.max(0, Math.min(maximum, Number(input.value) || 0));
-      if (key === "hp") unit.alive = unit.hp > 0;
+      if (key === "hp") {
+        const result = engine.setUnitHp(state, unit.instanceId, input.value);
+        if (!result.ok) showNotice(result.reason);
+      } else {
+        const maximum = key === "sp" ? unit.maxSp : key === "energy" ? unit.maxEnergy : Number.POSITIVE_INFINITY;
+        unit[key] = Math.max(0, Math.min(maximum, Number(input.value) || 0));
+      }
       render();
     }));
     root.querySelectorAll("[data-flag]").forEach((input) => input.addEventListener("change", () => {
@@ -316,7 +543,7 @@
     root.querySelector("[data-force-crit]")?.addEventListener("change", (event) => { state.forceCrit = event.target.checked; render(); });
     root.querySelector("[data-pause-timers]")?.addEventListener("change", (event) => { timersPaused = event.target.checked; render(); });
     root.querySelector("[data-force-defense]")?.addEventListener("change", (event) => { state.forceDefense = event.target.value; });
-    root.querySelector("[data-speed]")?.addEventListener("input", (event) => { battleSpeed = Number(event.target.value); event.target.nextElementSibling.value = `${battleSpeed.toFixed(2)}×`; });
+
     root.querySelector("[data-ready-ults]")?.addEventListener("click", () => mutate(() => {
       state.players.filter((unit) => unit.onField && unit.alive).forEach((unit) => { unit.energy = unit.maxEnergy; });
       return { ok: true };
@@ -328,6 +555,7 @@
       return { ok: true };
     }));
     root.querySelector("[data-undo]")?.addEventListener("click", undo);
+    root.querySelector("[data-new-encounter]")?.addEventListener("click", newEncounter);
     root.querySelector("[data-reset]")?.addEventListener("click", resetBattle);
     root.querySelector("[data-export-log]")?.addEventListener("click", exportLog);
     root.querySelector("[data-editor]")?.addEventListener("click", () => {
@@ -350,13 +578,13 @@
       saveHistory();
       engine.prepareEnemyAttack(state);
       render();
-    }, 550 / battleSpeed);
+    }, state.config.enemyDelayMs);
   }
 
   function startDefenseMeter() {
     cancelDefenseTimers();
     defenseStartedAt = performance.now();
-    const duration = 2100 / battleSpeed;
+    const duration = state.config.defenseDurationMs;
     const cursor = root.querySelector("[data-cursor]");
     function frame(now) {
       if (state.phase !== "defense") return;
@@ -368,7 +596,7 @@
     defenseFrame = requestAnimationFrame(frame);
     defenseTimeout = setTimeout(() => {
       if (state.phase === "defense" && !timersPaused) submitDefense("hit");
-    }, duration + 120);
+    }, duration + state.config.defenseTimeoutGraceMs);
   }
 
   function cancelDefenseTimers() {
@@ -392,40 +620,83 @@
     enemyTimer = null;
     cancelDefenseTimers();
     state = history.pop();
+    pendingAction = null;
     render();
   }
 
-  function resetBattle() {
+  function openSetup(resources = null, resetConfiguration = false, message = "") {
     clearTimeout(enemyTimer);
     enemyTimer = null;
     cancelDefenseTimers();
     history = [];
-    state = engine.makeInitialState(runtimeData);
+    pendingAction = null;
+    if (resetConfiguration) setup = makeSetupState(runtimeData);
+    carriedResources = resources;
+    state = engine.makeInitialState(runtimeData, { autoStart: false, resources: carriedResources || undefined, seed: setup.seed });
     selectedDebugId = state.players[0].instanceId;
+    editorOpen = false;
+    if (message) showNotice(message);
     render();
+  }
+
+  function startConfiguredBattle() {
+    if (setup.deployedIds.length !== 4 || !setup.enemyIds.length) {
+      showNotice("Select four on-field units and at least one enemy.");
+      render();
+      return;
+    }
+    try {
+      const encounterData = buildEncounterData();
+      const errors = engine.validateData(encounterData);
+      if (errors.length) throw new Error(errors.join(" "));
+      state = engine.makeInitialState(encounterData, {
+        autoStart: false,
+        resources: carriedResources || undefined,
+        seed: setup.seed,
+      });
+      const result = engine.startBattle(state);
+      if (!result.ok) throw new Error(result.reason);
+      history = [];
+      pendingAction = null;
+      carriedResources = null;
+
+      selectedDebugId = state.players[0].instanceId;
+      render();
+    } catch (error) {
+      showNotice("Setup error: " + error.message);
+      render();
+    }
+  }
+
+  function resetBattle() {
+    openSetup(null, true, "Battle reset. Configure the next encounter.");
+  }
+
+  function newEncounter() {
+    openSetup(engine.capturePersistentResources(state), false, "Encounter setup opened; personal SP and Energy are preserved.");
   }
 
   function applyEditorData() {
     const textarea = root.querySelector("[data-editor-json]");
     try {
       const parsed = JSON.parse(textarea.value);
-      if (!Array.isArray(parsed.units) || !parsed.units.length || !Array.isArray(parsed.enemies) || !parsed.enemies.length || !parsed.config) throw new Error("Data requires config, units, and enemies.");
+      const errors = engine.validateData(parsed);
+      if (errors.length) throw new Error(errors.join(" "));
       runtimeData = parsed;
       localStorage.setItem(storageKey, JSON.stringify(runtimeData));
-      editorOpen = false;
-      resetBattle();
-      showNotice("Runtime data applied.");
+      setup = makeSetupState(runtimeData);
+      openSetup(null, false, "Runtime data applied. Review the encounter before starting.");
     } catch (error) {
       showNotice(`JSON error: ${error.message}`);
+      render();
     }
   }
 
   function restoreDefaults() {
     runtimeData = engine.clone(defaults);
     localStorage.removeItem(storageKey);
-    editorOpen = false;
-    resetBattle();
-    showNotice("Default data restored.");
+    setup = makeSetupState(runtimeData);
+    openSetup(null, false, "Default data restored. Review the encounter before starting.");
   }
 
   function exportLog() {
