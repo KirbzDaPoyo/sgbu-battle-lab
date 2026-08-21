@@ -3,6 +3,99 @@
   const clamp = (min, max, value) => Math.max(min, Math.min(max, value));
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const baseAv = (speed) => 10000 / Math.max(1, speed);
+  const actionTypes = new Set(["damage", "laneDamage", "allDamage", "buff", "debuffDamage", "allDebuffDamage", "heal", "teamHeal", "teamShield", "teamShieldCleanse", "teamAdvance"]);
+  const requiredConfigNumbers = [
+    "baseAp", "initialSp", "initialEnergyPercent", "normalBasicMultiplier", "chargedBasicMultiplier", "plungeBasicMultiplier",
+    "normalSpGain", "chargedSpCost", "ultimateSpGain", "normalEnergyGain", "chargedEnergyGain", "plungeEnergyGain",
+    "skillEnergyGain", "critRate", "critMultiplier", "damageVariance", "defenseBase", "defenseLevelScale", "healHpScale",
+    "level", "vulnerableMultiplier", "weakenMultiplier", "reactionWindowMin", "reactionWindowBase", "reactionWindowMax",
+    "reactionWindowFallback", "parryWindowScale", "enemySingleMultiplier", "enemyLaneMultiplier", "introAtkUp",
+    "introDuration", "enemyDelayMs", "defenseDurationMs", "defenseTimeoutGraceMs", "maxLogEntries",
+  ];
+
+  function validateData(source) {
+    const errors = [];
+    const isObject = (value) => value && typeof value === "object" && !Array.isArray(value);
+    const finite = (value) => typeof value === "number" && Number.isFinite(value);
+    const requireText = (value, path) => {
+      if (typeof value !== "string" || !value.trim()) errors.push(path + " must be a non-empty string.");
+    };
+    const requireNumber = (value, path, minimum = 0) => {
+      if (!finite(value) || value < minimum) errors.push(path + " must be a finite number >= " + minimum + ".");
+    };
+    const validateAction = (action, path, isSkill) => {
+      if (!isObject(action)) {
+        errors.push(path + " must be an object.");
+        return;
+      }
+      requireText(action.name, path + ".name");
+      requireText(action.description, path + ".description");
+      if (!actionTypes.has(action.type)) errors.push(path + ".type is not supported.");
+      requireNumber(action.multiplier, path + ".multiplier");
+      if (isSkill) requireNumber(action.spCost, path + ".spCost");
+      if (["buff", "debuffDamage", "allDebuffDamage", "teamAdvance"].includes(action.type)) requireNumber(action.duration, path + ".duration", 1);
+      if (action.type === "teamAdvance") requireNumber(action.advance, path + ".advance");
+      for (const key of ["selfHpCost", "vulnerability", "weaken"]) {
+        if (action[key] !== undefined && (!finite(action[key]) || action[key] < 0 || action[key] > 1)) errors.push(path + "." + key + " must be between 0 and 1.");
+      }
+    };
+
+    if (!isObject(source)) return ["Runtime data must be an object."];
+    if (!isObject(source.config)) errors.push("config must be an object.");
+    else {
+      requiredConfigNumbers.forEach((key) => requireNumber(source.config[key], "config." + key));
+      if (finite(source.config.initialEnergyPercent) && (source.config.initialEnergyPercent < 0 || source.config.initialEnergyPercent > 100)) errors.push("config.initialEnergyPercent must be between 0 and 100.");
+      if (finite(source.config.reactionWindowMin) && finite(source.config.reactionWindowBase) && finite(source.config.reactionWindowMax)
+        && !(source.config.reactionWindowMin <= source.config.reactionWindowBase && source.config.reactionWindowBase <= source.config.reactionWindowMax)) {
+        errors.push("Reaction windows must satisfy min <= base <= max.");
+      }
+    }
+
+    if (!Array.isArray(source.units) || !source.units.length) errors.push("units must be a non-empty array.");
+    else {
+      const ids = new Set();
+      source.units.forEach((unit, index) => {
+        const path = "units[" + index + "]";
+        if (!isObject(unit)) {
+          errors.push(path + " must be an object.");
+          return;
+        }
+        for (const key of ["id", "name", "className", "subclass"]) requireText(unit[key], path + "." + key);
+        if (ids.has(unit.id)) errors.push(path + ".id must be unique.");
+        ids.add(unit.id);
+        for (const key of ["maxHp", "atk", "def", "speed", "maxSp", "maxEnergy"]) requireNumber(unit[key], path + "." + key, key === "def" ? 0 : 1);
+        for (const key of ["accuracy", "evasion"]) requireNumber(unit[key], path + "." + key);
+        validateAction(unit.skill, path + ".skill", true);
+        validateAction(unit.ultimate, path + ".ultimate", false);
+      });
+    }
+
+    if (!Array.isArray(source.enemies) || !source.enemies.length) errors.push("enemies must be a non-empty array.");
+    else {
+      if (source.enemies.length > 10) errors.push("enemies cannot contain more than ten combatants.");
+      const ids = new Set();
+      const cells = new Set();
+      source.enemies.forEach((enemy, index) => {
+        const path = "enemies[" + index + "]";
+        if (!isObject(enemy)) {
+          errors.push(path + " must be an object.");
+          return;
+        }
+        for (const key of ["id", "name"]) requireText(enemy[key], path + "." + key);
+        if (ids.has(enemy.id)) errors.push(path + ".id must be unique.");
+        ids.add(enemy.id);
+        for (const key of ["maxHp", "atk", "def", "speed"]) requireNumber(enemy[key], path + "." + key, key === "def" ? 0 : 1);
+        for (const key of ["accuracy", "evasion"]) requireNumber(enemy[key], path + "." + key);
+        if (!["front", "rear"].includes(enemy.lane)) errors.push(path + ".lane must be front or rear.");
+        if (!Number.isInteger(enemy.column) || enemy.column < 1 || enemy.column > 5) errors.push(path + ".column must be an integer from 1 to 5.");
+        if (!["single", "lane"].includes(enemy.attackType)) errors.push(path + ".attackType must be single or lane.");
+        const cell = enemy.lane + ":" + enemy.column;
+        if (cells.has(cell)) errors.push(path + " duplicates formation cell " + cell + ".");
+        cells.add(cell);
+      });
+    }
+    return errors;
+  }
 
   function seededRandom(seed) {
     let value = seed >>> 0;
@@ -15,14 +108,16 @@
     };
   }
 
-  function makeCombatant(template, team, index, onField = true) {
+  function makeCombatant(template, team, index, onField = true, config = {}, persisted = null) {
+    const initialSp = persisted?.sp ?? config.initialSp ?? 0;
+    const initialEnergy = persisted?.energy ?? Math.round(template.maxEnergy * (config.initialEnergyPercent ?? 0) / 100);
     return {
       ...clone(template),
       instanceId: `${team}-${template.id}-${index}`,
       team,
       hp: template.maxHp,
-      sp: team === "player" ? 40 : 0,
-      energy: 0,
+      sp: team === "player" ? clamp(0, template.maxSp, initialSp) : 0,
+      energy: team === "player" ? clamp(0, template.maxEnergy, initialEnergy) : 0,
       apBonus: 0,
       shield: 0,
       av: baseAv(template.speed),
@@ -35,39 +130,76 @@
     };
   }
 
-  function makeInitialState(overrideData) {
+  function makeInitialState(overrideData, options = {}) {
     const source = overrideData || data;
-    const players = source.units.map((unit, index) => makeCombatant(unit, "player", index, index < 4));
-    const enemies = source.enemies.map((enemy, index) => makeCombatant(enemy, "enemy", index, true));
+    const errors = validateData(source);
+    if (errors.length) throw new Error(errors[0]);
+    const resources = options.resources || {};
+    const players = source.units.map((unit, index) => makeCombatant(unit, "player", index, index < 4, source.config, resources[unit.id]));
+    const enemies = source.enemies.map((enemy, index) => makeCombatant(enemy, "enemy", index, true, source.config));
     const state = {
-      version: 1,
-      seed: 137,
+      version: 2,
+      seed: options.seed ?? 137,
       rngCalls: 0,
+      logSequence: 0,
       config: clone(source.config),
       players,
       enemies,
       currentId: null,
       currentAp: 0,
-      phase: "ready",
+      phase: options.autoStart === false ? "setup" : "ready",
       turn: 0,
       switchUsed: false,
       selectedTargetId: enemies[0]?.instanceId || null,
       selectedAllyId: players[0]?.instanceId || null,
       pendingDefense: null,
       replacementIds: [],
+      interrupt: null,
       forceCrit: false,
       forceDefense: "timed",
       log: [],
       lastBreakdown: null,
     };
-    addLog(state, "Battle initialized. The timeline is ready.", "system");
-    advanceTimeline(state);
+    if (options.autoStart === false) {
+      addLog(state, "Encounter setup is ready. Combat has not started.", "system");
+    } else {
+      addLog(state, "Battle initialized. The timeline is ready.", "system");
+      advanceTimeline(state);
+    }
     return state;
   }
 
+  function openUltimateWindow(state, continuation, message) {
+    state.phase = "interrupt";
+    state.interrupt = { continuation };
+    addLog(state, message || "Ultimate window opened before the next action.", "system");
+  }
+
+  function startBattle(state) {
+    if (state.phase !== "setup") return { ok: false, reason: "This encounter has already started." };
+    openUltimateWindow(state, "advanceTimeline", "Encounter confirmed. Ultimates may be used before the timeline begins.");
+    return { ok: true };
+  }
+
+  function continueBattle(state) {
+    if (state.phase !== "interrupt" || !state.interrupt) return { ok: false, reason: "No Ultimate window is active." };
+    if (state.replacementIds.length) return { ok: false, reason: "Complete the forced replacement first." };
+    const continuation = state.interrupt.continuation;
+    state.interrupt = null;
+    if (continuation === "resumePlayer") {
+      state.phase = "player";
+    } else {
+      state.phase = "ready";
+      advanceTimeline(state);
+    }
+    return { ok: true };
+  }
+
   function addLog(state, message, type = "info") {
-    state.log.unshift({ id: `${Date.now()}-${state.log.length}`, turn: state.turn, message, type });
-    state.log = state.log.slice(0, 240);
+    const sequence = state.logSequence || 0;
+    state.logSequence = sequence + 1;
+    state.log.unshift({ id: "event-" + sequence, turn: state.turn, message, type });
+    state.log = state.log.slice(0, state.config?.maxLogEntries || 240);
   }
 
   function allCombatants(state) {
@@ -113,13 +245,21 @@
     return actor;
   }
 
-  function finishCurrentTurn(state) {
+  function finishCurrentTurn(state, advance = true) {
     const actor = findUnit(state, state.currentId);
     if (actor && actor.alive) actor.av = baseAv(actor.speed);
     state.currentId = null;
     state.currentAp = 0;
     state.pendingDefense = null;
-    if (!state.replacementIds.length) advanceTimeline(state);
+    if (advance && !state.replacementIds.length) advanceTimeline(state);
+  }
+
+  function endPlayerTurn(state) {
+    const actor = findUnit(state, state.currentId);
+    if (!actor || actor.team !== "player" || state.phase !== "player") return { ok: false, reason: "No player turn is active." };
+    finishCurrentTurn(state, false);
+    if (!checkEnd(state)) openUltimateWindow(state, "advanceTimeline", "Turn ended. Ultimates may be used before the timeline advances.");
+    return { ok: true };
   }
 
   function randomForState(state) {
@@ -140,16 +280,20 @@
     else unit.statuses.push({ ...status });
   }
 
+  function statusMultiplier(unit, id, fallback) {
+    return unit.statuses.find((status) => status.id === id)?.multiplier ?? fallback;
+  }
+
   function damageBreakdown(state, attacker, defender, multiplier, options = {}) {
-    const atkMultiplier = hasStatus(attacker, "atkUp") ? 1.25 : 1;
+    const atkMultiplier = statusMultiplier(attacker, "atkUp", 1);
     const base = attacker.atk * multiplier * atkMultiplier;
-    const defMultiplier = 1 - defender.def / (defender.def + 200 + 10 * state.config.level);
-    const vulnerable = hasStatus(defender, "vulnerable") ? 1.2 : 1;
-    const weaken = hasStatus(attacker, "weaken") ? 0.8 : 1;
+    const defMultiplier = 1 - defender.def / (defender.def + state.config.defenseBase + state.config.defenseLevelScale * state.config.level);
+    const vulnerable = statusMultiplier(defender, "vulnerable", 1);
+    const weaken = statusMultiplier(attacker, "weaken", 1);
     const debuffBonus = options.debuffBonus && defender.statuses.length ? 1 + options.debuffBonus : 1;
-    const crit = state.forceCrit || randomForState(state) < 0.05;
-    const critMultiplier = crit ? 1.5 : 1;
-    const variance = 0.95 + randomForState(state) * 0.1;
+    const crit = state.forceCrit || randomForState(state) < state.config.critRate;
+    const critMultiplier = crit ? state.config.critMultiplier : 1;
+    const variance = 1 - state.config.damageVariance + randomForState(state) * state.config.damageVariance * 2;
     const total = Math.max(1, Math.round(base * defMultiplier * vulnerable * weaken * debuffBonus * critMultiplier * variance));
     return { base: Math.round(base), defMultiplier, vulnerable, weaken, debuffBonus, crit, critMultiplier, variance, total };
   }
@@ -167,33 +311,49 @@
   }
 
   function heal(state, source, target, multiplier) {
-    const amount = Math.max(1, Math.round(source.atk * multiplier + source.maxHp * 0.08));
+    const amount = Math.max(1, Math.round(source.atk * multiplier + source.maxHp * state.config.healHpScale));
     const restored = Math.min(amount, target.maxHp - target.hp);
     target.hp += restored;
     addLog(state, `${source.name} restores ${restored} HP to ${target.name}.`, "heal");
+  }
+
+  function livingReserves(state) {
+    return state.players.filter((unit) => unit.alive && !unit.onField);
+  }
+
+  function reconcileReplacementQueue(state) {
+    const pending = state.replacementIds.filter((id) => {
+      const unit = findUnit(state, id);
+      return unit?.team === "player" && unit.onField && !unit.alive;
+    });
+    state.replacementIds = pending.slice(0, livingReserves(state).length);
   }
 
   function handleDefeat(state, target) {
     if (target.hp > 0 || !target.alive) return;
     target.alive = false;
     addLog(state, `${target.name} is defeated.`, "defeat");
-    if (target.team === "player" && target.onField) {
-      const reserves = state.players.filter((unit) => unit.alive && !unit.onField);
-      if (reserves.length) state.replacementIds.push(target.instanceId);
+    if (target.team === "player" && target.onField && !state.replacementIds.includes(target.instanceId)) {
+      const capacity = livingReserves(state).length;
+      if (state.replacementIds.length < capacity) state.replacementIds.push(target.instanceId);
     }
   }
 
   function checkEnd(state) {
     if (state.phase === "victory" || state.phase === "defeat") return true;
+    reconcileReplacementQueue(state);
     if (!state.enemies.some((unit) => unit.alive)) {
       state.phase = "victory";
       state.currentId = null;
+      state.currentAp = 0;
       addLog(state, "Victory. All enemy targets are offline.", "victory");
       return true;
     }
     if (!state.players.some((unit) => unit.alive && unit.onField)) {
+      if (state.replacementIds.length) return false;
       state.phase = "defeat";
       state.currentId = null;
+      state.currentAp = 0;
       addLog(state, "Defeat. No deployed allies remain.", "defeat");
       return true;
     }
@@ -216,7 +376,12 @@
 
   function payAp(state, amount) {
     state.currentAp = Math.max(0, state.currentAp - amount);
-    if (state.currentAp === 0 && !state.replacementIds.length) finishCurrentTurn(state);
+    if (state.currentAp === 0) {
+      finishCurrentTurn(state, false);
+      if (!checkEnd(state)) openUltimateWindow(state, "advanceTimeline", "Turn ended. Ultimates may be used before the timeline advances.");
+      return;
+    }
+    openUltimateWindow(state, "resumePlayer", "Action resolved. Ultimates may be used before the next AP action.");
   }
 
   function useBasic(state, kind, targetId) {
@@ -227,9 +392,9 @@
     if (!target || !target.alive || target.team !== "enemy") return { ok: false, reason: "Select a living enemy." };
     if (protectedRearTarget(state, target)) return { ok: false, reason: "That rear target is protected by its front-column guard." };
     const definitions = {
-      normal: { name: "Normal ATK", multiplier: 1, sp: state.config.normalSpGain, energy: state.config.normalEnergyGain },
-      charged: { name: "Charged ATK", multiplier: 1.55, sp: -state.config.chargedSpCost, energy: state.config.chargedEnergyGain },
-      plunge: { name: "Plunging ATK", multiplier: 1.35, sp: 0, energy: state.config.plungeEnergyGain },
+      normal: { name: "Normal ATK", multiplier: state.config.normalBasicMultiplier, sp: state.config.normalSpGain, energy: state.config.normalEnergyGain },
+      charged: { name: "Charged ATK", multiplier: state.config.chargedBasicMultiplier, sp: -state.config.chargedSpCost, energy: state.config.chargedEnergyGain },
+      plunge: { name: "Plunging ATK", multiplier: state.config.plungeBasicMultiplier, sp: 0, energy: state.config.plungeEnergyGain },
     };
     const action = definitions[kind];
     if (!action) return { ok: false, reason: "Unknown Basic ATK." };
@@ -265,7 +430,7 @@
       case "buff": {
         const ally = findUnit(state, targetId);
         if (!ally || ally.team !== "player" || !ally.onField || !ally.alive) return "Select a deployed ally.";
-        applyStatus(ally, { id: "atkUp", name: "ATK Up", duration: action.duration });
+        applyStatus(ally, { id: "atkUp", name: "ATK Up", duration: action.duration, multiplier: 1 + action.multiplier });
         addLog(state, `${ally.name} gains ATK Up for ${action.duration} turns.`, "buff");
         break;
       }
@@ -273,13 +438,23 @@
         if (!target || target.team !== "enemy") return "Select an enemy.";
         if (protectedRearTarget(state, target)) return "That rear target is protected by its front-column guard.";
         dealDamage(state, actor, target, action.multiplier);
-        applyStatus(target, { id: "vulnerable", name: "Vulnerable", duration: action.duration });
+        applyStatus(target, {
+          id: "vulnerable",
+          name: "Vulnerable",
+          duration: action.duration,
+          multiplier: 1 + (action.vulnerability ?? state.config.vulnerableMultiplier - 1),
+        });
         addLog(state, `${target.name} becomes Vulnerable.`, "debuff");
         break;
       case "allDebuffDamage":
         livingEnemies.forEach((unit) => {
           dealDamage(state, actor, unit, action.multiplier);
-          applyStatus(unit, { id: "weaken", name: "Weaken", duration: action.duration });
+          applyStatus(unit, {
+            id: "weaken",
+            name: "Weaken",
+            duration: action.duration,
+            multiplier: 1 - (action.weaken ?? 1 - state.config.weakenMultiplier),
+          });
         });
         break;
       case "heal": {
@@ -301,8 +476,8 @@
         break;
       case "teamAdvance":
         deployed.forEach((unit) => {
-          applyStatus(unit, { id: "atkUp", name: "ATK Up", duration: 2 });
-          unit.av = Math.max(0, unit.av - baseAv(unit.speed) * 0.2);
+          applyStatus(unit, { id: "atkUp", name: "ATK Up", duration: action.duration, multiplier: 1 + action.multiplier });
+          unit.av = Math.max(0, unit.av - baseAv(unit.speed) * action.advance);
         });
         addLog(state, `${actor.name} advances and empowers the deployed team.`, "buff");
         break;
@@ -321,6 +496,12 @@
     if (reason) return { ok: false, reason };
     actor.sp -= actor.skill.spCost;
     actor.energy = clamp(0, actor.maxEnergy, actor.energy + state.config.skillEnergyGain);
+    if (actor.skill.selfHpCost > 0) {
+      const hpCost = Math.max(1, Math.floor(actor.hp * actor.skill.selfHpCost));
+      actor.hp = Math.max(0, actor.hp - hpCost);
+      addLog(state, `${actor.name} loses ${hpCost} HP to ${actor.skill.name}.`, "resource");
+      handleDefeat(state, actor);
+    }
     addLog(state, `${actor.name} uses ${actor.skill.name}.`, "action");
     payAp(state, 2);
     checkEnd(state);
@@ -330,7 +511,7 @@
   function useUltimate(state, actorId, targetId) {
     const actor = findUnit(state, actorId);
     if (!actor || actor.team !== "player" || !actor.alive || !actor.onField) return { ok: false, reason: "Only a living deployed ally can use an Ultimate." };
-    if (["defense", "victory", "defeat"].includes(state.phase)) return { ok: false, reason: "The Ultimate cannot interrupt this phase." };
+    if (state.replacementIds.length || ["defense", "victory", "defeat"].includes(state.phase)) return { ok: false, reason: "The Ultimate cannot interrupt this phase." };
     if (actor.energy < actor.maxEnergy) return { ok: false, reason: "Energy is not full." };
     const reason = executeEffect(state, actor, actor.ultimate, targetId);
     if (reason) return { ok: false, reason };
@@ -356,7 +537,12 @@
     state.currentId = incoming.instanceId;
     state.switchUsed = true;
     state.selectedAllyId = incoming.instanceId;
-    applyStatus(incoming, { id: "atkUp", name: "Intro: ATK Up", duration: 1 });
+    applyStatus(incoming, {
+      id: "atkUp",
+      name: "Intro: ATK Up",
+      duration: state.config.introDuration,
+      multiplier: 1 + state.config.introAtkUp,
+    });
     addLog(state, `${outgoing.name} uses Outro; ${incoming.name} enters slot ${slot + 1} and inherits ${state.currentAp} AP.`, "switch");
     return { ok: true };
   }
@@ -364,15 +550,18 @@
   function replaceDefeated(state, defeatedId, incomingId) {
     const defeated = findUnit(state, defeatedId);
     const incoming = findUnit(state, incomingId);
-    if (!defeated || !incoming || incoming.onField || !incoming.alive) return { ok: false, reason: "Invalid replacement." };
+    const validDefeated = defeated?.team === "player" && defeated.onField && !defeated.alive && state.replacementIds.includes(defeatedId);
+    const validIncoming = incoming?.team === "player" && !incoming.onField && incoming.alive;
+    if (!validDefeated || !validIncoming) return { ok: false, reason: "Invalid replacement." };
     incoming.onField = true;
     incoming.slot = defeated.slot;
     incoming.av = baseAv(incoming.speed);
     defeated.onField = false;
     defeated.slot = null;
     state.replacementIds = state.replacementIds.filter((id) => id !== defeatedId);
+    reconcileReplacementQueue(state);
     addLog(state, `${incoming.name} replaces defeated ${defeated.name}.`, "switch");
-    if (!state.replacementIds.length && !state.currentId) advanceTimeline(state);
+    if (!state.replacementIds.length && !state.currentId && !checkEnd(state) && !state.interrupt) advanceTimeline(state);
     return { ok: true };
   }
 
@@ -389,18 +578,26 @@
     } else {
       targets = [deployed[Math.floor(randomForState(state) * deployed.length)]];
     }
-    state.pendingDefense = { enemyId: enemy.instanceId, targetIds: targets.map((unit) => unit.instanceId), multiplier: enemy.attackType === "lane" ? 0.9 : 1.25 };
+    state.pendingDefense = {
+      enemyId: enemy.instanceId,
+      targetIds: targets.map((unit) => unit.instanceId),
+      multiplier: enemy.attackType === "lane" ? state.config.enemyLaneMultiplier : state.config.enemySingleMultiplier,
+    };
     state.phase = "defense";
     return state.pendingDefense;
   }
 
   function reactionWindow(state, mode) {
     const pending = state.pendingDefense;
-    if (!pending) return 0.2;
+    if (!pending) return state.config.reactionWindowFallback;
     const enemy = findUnit(state, pending.enemyId);
     const eligible = pending.targetIds.map((id) => findUnit(state, id)).filter((unit) => unit && !unit.crowdControlled);
     const evasion = eligible.length ? eligible.reduce((sum, unit) => sum + unit.evasion, 0) / eligible.length : 0;
-    const base = clamp(0.1, 0.34, 0.22 * (1 + evasion - enemy.accuracy));
+    const base = clamp(
+      state.config.reactionWindowMin,
+      state.config.reactionWindowMax,
+      state.config.reactionWindowBase * (1 + evasion - enemy.accuracy),
+    );
     return mode === "parry" ? base * state.config.parryWindowScale : base;
   }
 
@@ -423,16 +620,45 @@
       }
     });
     state.pendingDefense = null;
-    state.phase = "enemy";
-    finishCurrentTurn(state);
-    checkEnd(state);
+    finishCurrentTurn(state, false);
+    if (!checkEnd(state)) openUltimateWindow(state, "advanceTimeline", "Enemy action resolved. Ultimates may be used before the next turn.");
     return { ok: true, success: finalSuccess };
+  }
+
+  function capturePersistentResources(state) {
+    return Object.fromEntries(state.players.map((unit) => [unit.id, { sp: unit.sp, energy: unit.energy }]));
+  }
+
+  function setUnitHp(state, unitId, value) {
+    const unit = findUnit(state, unitId);
+    if (!unit) return { ok: false, reason: "Combatant not found." };
+    const nextHp = clamp(0, unit.maxHp, Number(value) || 0);
+    const wasAlive = unit.alive;
+    unit.hp = nextHp;
+    if (nextHp === 0) {
+      handleDefeat(state, unit);
+      if (unit.instanceId === state.currentId && !unit.alive) {
+        state.currentId = null;
+        state.currentAp = 0;
+        state.pendingDefense = null;
+      }
+    } else if (!wasAlive) {
+      unit.alive = true;
+      state.replacementIds = state.replacementIds.filter((id) => id !== unit.instanceId);
+      if ((state.phase === "defeat" && unit.team === "player") || (state.phase === "victory" && unit.team === "enemy")) state.phase = "ready";
+      addLog(state, unit.name + " is restored by debug controls.", "heal");
+    }
+    reconcileReplacementQueue(state);
+    const ended = checkEnd(state);
+    if (!ended && !state.replacementIds.length && !state.currentId) advanceTimeline(state);
+    return { ok: true };
   }
 
   function timelinePreview(state) {
     return timelineUnits(state)
+      .slice()
+      .sort((a, b) => a.av - b.av || b.speed - a.speed)
       .map((unit) => ({ id: unit.instanceId, name: unit.name, team: unit.team, av: unit.av, color: unit.color }))
-      .sort((a, b) => a.av - b.av)
       .slice(0, 10);
   }
 
@@ -440,8 +666,11 @@
     addLog,
     advanceTimeline,
     baseAv,
+    capturePersistentResources,
     checkEnd,
+    continueBattle,
     clone,
+    endPlayerTurn,
     findUnit,
     finishCurrentTurn,
     makeInitialState,
@@ -450,11 +679,14 @@
     reactionWindow,
     replaceDefeated,
     resolveDefense,
+    setUnitHp,
+    startBattle,
     switchUnits,
     timelinePreview,
     useBasic,
     useSkill,
     useUltimate,
+    validateData,
     validEnemyTargets,
   };
 })();
